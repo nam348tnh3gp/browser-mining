@@ -1,188 +1,191 @@
-// ----- Khởi tạo biến toàn cục -----
-let ws = null;
+let socket;
 let cpuWorkers = [];
 let gpuWorker = null;
-let isRunning = false;
-let enableGPU = false;
+let cpuHr = 0, gpuHr = 0;
 
-let totalHashrate = 0;
-let cpuHashrate = 0;
-let gpuHashrate = 0;
-let sharesAccepted = 0;
-let sharesRejected = 0;
-
-const cpuThreadsInput = document.getElementById('cpuThreads');
-const enableGPUCheckbox = document.getElementById('enableGPU');
-const gpuStatusSpan = document.getElementById('gpuStatus');
+const poolHost = document.getElementById('poolHost');
+const poolPort = document.getElementById('poolPort');
+const workerField = document.getElementById('worker');
+const passwordField = document.getElementById('password');
+const cpuThreads = document.getElementById('cpuThreads');
+const enableGPU = document.getElementById('enableGPU');
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
-const logEl = document.getElementById('log');
+const logDiv = document.getElementById('log');
+const statusSpan = document.getElementById('status');
+const totalHashrateSpan = document.getElementById('totalHashrate');
+const cpuHashrateSpan = document.getElementById('cpuHashrate');
+const gpuHashrateSpan = document.getElementById('gpuHashrate');
+const sharesSpan = document.getElementById('shares');
+const rejectedSpan = document.getElementById('rejected');
 
-// ----- Kiểm tra hỗ trợ WebGPU -----
+// Kiểm tra WebGPU
 async function checkWebGPU() {
-    if (navigator.gpu) {
-        try {
-            const adapter = await navigator.gpu.requestAdapter();
-            if (adapter) {
-                enableGPUCheckbox.disabled = false;
-                gpuStatusSpan.textContent = '✅ Có hỗ trợ WebGPU';
-                gpuStatusSpan.style.color = '#4caf50';
-                return true;
-            }
-        } catch (e) {}
+    if (!navigator.gpu) {
+        enableGPU.disabled = true;
+        document.getElementById('gpuStatus').textContent = '❌ Không hỗ trợ';
+        return false;
     }
-    gpuStatusSpan.textContent = '❌ Không hỗ trợ WebGPU';
-    gpuStatusSpan.style.color = '#f44336';
-    return false;
+    enableGPU.disabled = false;
+    document.getElementById('gpuStatus').textContent = '✅ Sẵn sàng';
+    return true;
 }
 checkWebGPU();
 
-enableGPUCheckbox.onchange = () => {
-    if (!isRunning) enableGPU = enableGPUCheckbox.checked;
-    else alert('Không thể thay đổi khi đang đào');
-};
+startBtn.addEventListener('click', () => {
+    if (!workerField.value.trim()) {
+        alert('Vui lòng nhập Worker!');
+        return;
+    }
+    connect();
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+});
 
-// ----- Log helper -----
-function log(msg, color) {
-    const line = document.createElement('div');
-    line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
-    if (color) line.style.color = color;
-    logEl.appendChild(line);
-    logEl.scrollTop = logEl.scrollHeight;
-}
+stopBtn.addEventListener('click', () => {
+    disconnect();
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+});
 
-function updateStats() {
-    document.getElementById('totalHashrate').textContent = (totalHashrate / 1000).toFixed(2) + ' kH/s';
-    document.getElementById('cpuHashrate').textContent = (cpuHashrate / 1000).toFixed(2) + ' kH/s';
-    document.getElementById('gpuHashrate').textContent = (gpuHashrate / 1000).toFixed(2) + ' kH/s';
-    document.getElementById('shares').textContent = sharesAccepted;
-    document.getElementById('rejected').textContent = sharesRejected;
-}
+function connect() {
+    // Dùng hostname và port hiện tại để kết nối bridge (hỗ trợ file://)
+    const bridgePort = location.port || '3000';
+    const wsUrl = `ws://${location.hostname}:${bridgePort}`;
+    socket = new WebSocket(wsUrl);
 
-// ----- Kết nối WebSocket -----
-function connect(host, port, worker, password) {
-    ws = new WebSocket(`ws://${location.host}`);
-
-    ws.onopen = () => {
-        log('WebSocket connected to bridge', '#4caf50');
-        document.getElementById('status').textContent = 'Đang kết nối pool...';
-        ws.send(JSON.stringify({ type: 'connect', host, port, worker, password }));
+    socket.onopen = () => {
+        log('WebSocket connected to bridge');
+        socket.send(JSON.stringify({
+            type: 'connect',
+            host: poolHost.value.trim(),
+            port: parseInt(poolPort.value) || 3333,
+            worker: workerField.value.trim(),
+            password: passwordField.value.trim() || 'x'
+        }));
+        updateStatus('Connecting to pool...');
+        startWorkers();
     };
 
-    ws.onmessage = (e) => {
+    socket.onmessage = (e) => {
         try {
             const msg = JSON.parse(e.data);
             if (msg.type === 'pool') {
-                // Chuyển dữ liệu stratum cho tất cả worker
-                broadcastToWorkers(msg.data);
+                // Forward stratum message đến workers
+                const stratumMsg = { type: 'stratum', data: msg.data };
+                cpuWorkers.forEach(w => w.postMessage(stratumMsg));
+                if (gpuWorker) gpuWorker.postMessage(stratumMsg);
             } else if (msg.type === 'status') {
-                log(msg.message, '#ff9800');
-                document.getElementById('status').textContent = msg.message;
+                updateStatus(msg.message);
+                log(msg.message);
             } else if (msg.type === 'error') {
-                log('Lỗi: ' + msg.message, '#f44336');
+                updateStatus('Error: ' + msg.message);
+                log('ERROR: ' + msg.message);
+            } else if (msg.type === 'share_result') {
+                if (msg.accepted) {
+                    sharesSpan.textContent = parseInt(sharesSpan.textContent) + 1;
+                    log('✅ Share accepted');
+                } else {
+                    rejectedSpan.textContent = parseInt(rejectedSpan.textContent) + 1;
+                    log('❌ Share rejected: ' + (msg.error || 'unknown'));
+                }
             }
-        } catch (ex) {}
+        } catch (err) {
+            console.error('Parse error:', err);
+        }
     };
 
-    ws.onerror = (err) => log('WebSocket error', '#f44336');
-    ws.onclose = () => log('WebSocket disconnected', '#f44336');
+    socket.onclose = () => {
+        updateStatus('Disconnected');
+        stopAllWorkers();
+    };
+
+    socket.onerror = () => {
+        updateStatus('Connection error');
+        log('WebSocket error');
+    };
 }
 
-// ----- Gửi dữ liệu stratum đến tất cả worker -----
-function broadcastToWorkers(stratumLine) {
-    cpuWorkers.forEach(w => w.postMessage({ type: 'stratum', data: stratumLine }));
-    if (gpuWorker) gpuWorker.postMessage({ type: 'stratum', data: stratumLine });
+function disconnect() {
+    if (socket) {
+        socket.send(JSON.stringify({ type: 'disconnect' }));
+        socket.close();
+    }
+    stopAllWorkers();
 }
 
-// ----- Gửi share lên pool -----
-window.sendShare = function(shareData) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'mining', data: shareData }));
-        log('Share submitted: ' + JSON.stringify(shareData.params).substring(0, 60), '#2196f3');
+function startWorkers() {
+    stopAllWorkers(); // dọn dẹp cũ
+    const numThreads = parseInt(cpuThreads.value) || 2;
+    for (let i = 0; i < numThreads; i++) {
+        const worker = new Worker('miner-cpu.js');
+        worker.onmessage = handleWorkerMessage;
+        cpuWorkers.push(worker);
     }
-};
+    log(`Started ${numThreads} CPU threads`);
 
-// ----- Bắt đầu đào -----
-startBtn.onclick = () => {
-    const host = document.getElementById('poolHost').value;
-    const port = parseInt(document.getElementById('poolPort').value);
-    const worker = document.getElementById('worker').value;
-    const password = document.getElementById('password').value;
-    const cpuThreads = parseInt(cpuThreadsInput.value) || 2;
-
-    if (!host || !port || !worker) return alert('Thiếu thông tin pool');
-
-    enableGPU = enableGPUCheckbox.checked && !enableGPUCheckbox.disabled;
-    
-    // Kết nối pool
-    connect(host, port, worker, password);
-    
-    // Tạo CPU workers
-    cpuWorkers = [];
-    for (let i = 0; i < cpuThreads; i++) {
-        const w = new Worker('miner-cpu.js');
-        w.onmessage = handleWorkerMessage;
-        cpuWorkers.push(w);
-    }
-    
-    // Tạo GPU worker nếu bật
-    if (enableGPU) {
-        gpuWorker = new Worker('miner-gpu.js');
-        gpuWorker.onmessage = handleWorkerMessage;
-    }
-
-    isRunning = true;
-    startBtn.disabled = true;
-    stopBtn.disabled = false;
-    enableGPUCheckbox.disabled = true;
-    cpuThreadsInput.disabled = true;
-    document.getElementById('status').textContent = 'Đang đào...';
-    log('Bắt đầu đào với ' + cpuThreads + ' threads CPU' + (enableGPU ? ' + GPU' : ''), '#ff9800');
-};
-
-// ----- Xử lý message từ worker -----
-function handleWorkerMessage(e) {
-    const msg = e.data;
-    
-    if (msg.type === 'hashrate') {
-        if (msg.source === 'cpu') {
-            cpuHashrate = msg.value;
-        } else if (msg.source === 'gpu') {
-            gpuHashrate = msg.value;
+    if (enableGPU.checked && !enableGPU.disabled) {
+        try {
+            gpuWorker = new Worker('miner-gpu.js');
+            gpuWorker.onmessage = handleWorkerMessage;
+            log('GPU miner started');
+        } catch (e) {
+            log('GPU worker failed: ' + e.message);
         }
-        totalHashrate = cpuHashrate + gpuHashrate;
-        updateStats();
-    }
-    else if (msg.type === 'share') {
-        sendShare(msg.data);
-    }
-    else if (msg.type === 'share_accepted') {
-        sharesAccepted++;
-        updateStats();
-        log('✅ Share accepted', '#4caf50');
-    }
-    else if (msg.type === 'share_rejected') {
-        sharesRejected++;
-        updateStats();
-        log('❌ Share rejected: ' + (msg.reason || ''), '#f44336');
     }
 }
 
-// ----- Dừng đào -----
-stopBtn.onclick = () => {
-    if (ws) ws.close();
+function stopAllWorkers() {
     cpuWorkers.forEach(w => w.terminate());
-    if (gpuWorker) gpuWorker.terminate();
     cpuWorkers = [];
-    gpuWorker = null;
-    ws = null;
-    isRunning = false;
-    totalHashrate = cpuHashrate = gpuHashrate = 0;
-    updateStats();
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
-    enableGPUCheckbox.disabled = false;
-    cpuThreadsInput.disabled = false;
-    document.getElementById('status').textContent = 'Đã dừng';
-    log('Mining stopped', '#ff9800');
-};
+    if (gpuWorker) {
+        gpuWorker.terminate();
+        gpuWorker = null;
+    }
+    cpuHr = 0;
+    gpuHr = 0;
+    updateHashrate();
+}
+
+function handleWorkerMessage(e) {
+    const data = e.data;
+    if (data.type === 'hashrate') {
+        if (data.source === 'cpu') cpuHr = data.value;
+        else if (data.source === 'gpu') gpuHr = data.value;
+        updateHashrate();
+    } else if (data.type === 'share') {
+        // Gửi share về bridge (dùng type 'share', cũng có thể 'mining' vì server đã chấp nhận cả hai)
+        if (socket && socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({
+                type: 'share',
+                data: data.data
+            }));
+            log('Share submitted');
+        }
+    }
+}
+
+function updateHashrate() {
+    const total = cpuHr + gpuHr;
+    totalHashrateSpan.textContent = formatHashrate(total);
+    cpuHashrateSpan.textContent = formatHashrate(cpuHr);
+    gpuHashrateSpan.textContent = formatHashrate(gpuHr);
+}
+
+function formatHashrate(h) {
+    if (h > 1e9) return (h / 1e9).toFixed(2) + ' GH/s';
+    if (h > 1e6) return (h / 1e6).toFixed(2) + ' MH/s';
+    if (h > 1e3) return (h / 1e3).toFixed(2) + ' kH/s';
+    return h.toFixed(0) + ' H/s';
+}
+
+function updateStatus(msg) {
+    statusSpan.textContent = msg;
+}
+
+function log(msg) {
+    const line = document.createElement('div');
+    line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    logDiv.appendChild(line);
+    logDiv.scrollTop = logDiv.scrollHeight;
+}
