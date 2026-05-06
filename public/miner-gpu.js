@@ -1,11 +1,9 @@
 // miner-gpu.js - WebGPU Bitcoin Mining Worker (Production Ready)
-// Yêu cầu: Trình duyệt hỗ trợ WebGPU (Chrome 113+, Edge 113+, ...)
-
 let currentJob = null;
-let currentTarget = null;               // sẽ được khởi tạo từ nbits hoặc set_difficulty
+let currentTarget = new Uint8Array(32).fill(0xff); // max target mặc định, an toàn
 let running = false;
 let hashrate = 0;
-let extraNonce1 = '';                  // hex string (thường 8 ký tự) từ pool
+let extraNonce1 = '';
 let extraNonce2 = 0;
 
 // WebGPU objects
@@ -17,26 +15,23 @@ let stagingBuffer;
 
 const WORKGROUP_SIZE = 256;
 const MAX_WORKGROUPS = 64;
-const NONCES_PER_DISPATCH = WORKGROUP_SIZE * MAX_WORKGROUPS; // 16384
+const NONCES_PER_DISPATCH = WORKGROUP_SIZE * MAX_WORKGROUPS;
 
-// ------------------------------------------------------------
-// 1. HÀM BĂM SHA-256D CHO CPU (Web Crypto)
-// ------------------------------------------------------------
+// Hàm SHA-256d qua Web Crypto
 async function sha256d(data) {
   const hash1 = await crypto.subtle.digest('SHA-256', data);
   const hash2 = await crypto.subtle.digest('SHA-256', hash1);
-  return new Uint8Array(hash2); // 32 bytes big-endian
+  return new Uint8Array(hash2);
 }
 
-// ------------------------------------------------------------
-// 2. KHỞI TẠO GPU VÀ SHADER (giữ nguyên)
-// ------------------------------------------------------------
+// Khởi tạo GPU
 async function initGPU() {
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) throw new Error('No WebGPU adapter');
   device = await adapter.requestDevice();
   queue = device.queue;
 
+  // Shader WGSL (giữ nguyên từ bản trước)
   const shaderCode = `
     struct Header { data: array<u32, 20> };
     struct Target { data: array<u32, 8> };
@@ -175,27 +170,12 @@ async function initGPU() {
   });
 
   const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
-  computePipeline = device.createComputePipeline({
-    layout: pipelineLayout,
-    compute: { module: shaderModule, entryPoint: 'main' }
-  });
+  computePipeline = device.createComputePipeline({ layout: pipelineLayout, compute: { module: shaderModule, entryPoint: 'main' } });
 
-  gpuBufferHeader = device.createBuffer({
-    size: 80,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
-  });
-  gpuBufferTarget = device.createBuffer({
-    size: 32,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
-  });
-  gpuBufferResults = device.createBuffer({
-    size: 8,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
-  });
-  stagingBuffer = device.createBuffer({
-    size: 8,
-    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-  });
+  gpuBufferHeader = device.createBuffer({ size: 80, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  gpuBufferTarget = device.createBuffer({ size: 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  gpuBufferResults = device.createBuffer({ size: 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+  stagingBuffer = device.createBuffer({ size: 8, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
 
   bindGroup = device.createBindGroup({
     layout: bindGroupLayout,
@@ -207,26 +187,17 @@ async function initGPU() {
   });
 }
 
-// ------------------------------------------------------------
-// 3. TIỆN ÍCH CHUYỂN ĐỔI
-// ------------------------------------------------------------
 function hexToBytes(hex) {
   if (hex.length % 2) hex = '0' + hex;
   const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
-  }
+  for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
   return bytes;
 }
 
-// ------------------------------------------------------------
-// 4. XÂY DỰNG MERKLE ROOT & HEADER
-// ------------------------------------------------------------
 async function buildMerkleRoot(coinb1, coinb2, merkleBranch) {
   const coinbaseHex = coinb1 + extraNonce1 + extraNonce2.toString(16).padStart(8, '0') + coinb2;
   const coinbaseBytes = hexToBytes(coinbaseHex);
   let merkleRoot = await sha256d(coinbaseBytes);
-
   for (const branch of merkleBranch) {
     const branchBytes = hexToBytes(branch);
     const combined = new Uint8Array(64);
@@ -234,7 +205,7 @@ async function buildMerkleRoot(coinb1, coinb2, merkleBranch) {
     combined.set(branchBytes, 32);
     merkleRoot = await sha256d(combined);
   }
-  return merkleRoot; // 32 bytes big-endian
+  return merkleRoot;
 }
 
 async function buildHeader(job) {
@@ -243,66 +214,59 @@ async function buildHeader(job) {
   const merkleRoot = await buildMerkleRoot(job[2], job[3], job[4]);
   const ntime = parseInt(job[7], 16);
   const nbits = parseInt(job[6], 16);
-
   const header = new Uint8Array(80);
   const view = new DataView(header.buffer);
-
   view.setInt32(0, version, true);
   header.set(prevHash, 4);
   header.set(merkleRoot, 36);
   view.setInt32(68, ntime, true);
   view.setInt32(72, nbits, true);
-  view.setInt32(76, 0, true); // nonce = 0 (shader tự đặt)
-
+  view.setInt32(76, 0, true);
   return header;
 }
 
 function headerToUint32Array(headerBytes) {
   const u32 = new Uint32Array(20);
   const view = new DataView(headerBytes.buffer);
-  for (let i = 0; i < 20; i++) {
-    u32[i] = view.getUint32(i * 4, true);
-  }
+  for (let i = 0; i < 20; i++) u32[i] = view.getUint32(i * 4, true);
   return u32;
 }
 
-// Cập nhật header và target buffer
 async function updateBuffers(job) {
   const headerBytes = await buildHeader(job);
   const headerU32 = headerToUint32Array(headerBytes);
   queue.writeBuffer(gpuBufferHeader, 0, headerU32.buffer);
 
-  // Chuyển target thành 8 u32 big-endian
   const targetU32 = new Uint32Array(8);
   for (let i = 0; i < 8; i++) {
-    targetU32[i] = (currentTarget[i * 4] << 24) |
-      (currentTarget[i * 4 + 1] << 16) |
-      (currentTarget[i * 4 + 2] << 8) |
-      currentTarget[i * 4 + 3];
+    targetU32[i] = (currentTarget[i * 4] << 24) | (currentTarget[i * 4 + 1] << 16) | (currentTarget[i * 4 + 2] << 8) | currentTarget[i * 4 + 3];
   }
   queue.writeBuffer(gpuBufferTarget, 0, targetU32.buffer);
 }
 
-// ------------------------------------------------------------
-// 5. TÍNH TARGET TỪ NBITS (theo chuẩn Bitcoin)
-// ------------------------------------------------------------
 function targetFromNbits(nbits) {
   const num = parseInt(nbits, 16);
   const exp = (num >> 24) & 0xff;
   const mant = num & 0x00ffffff;
-  // Nếu exp ≤ 3, target coi như bằng 0 (cực khó, không thể đào)
-  if (exp <= 3) return new Uint8Array(32); // toàn 0
+  if (exp <= 3) return new Uint8Array(32);
   const target = new Uint8Array(32);
   target[32 - exp] = (mant >> 16) & 0xff;
   target[32 - exp + 1] = (mant >> 8) & 0xff;
   target[32 - exp + 2] = mant & 0xff;
-  // Các byte còn lại giữ 0, riêng các byte đầu (cao nhất) cũng 0.
   return target;
 }
 
-// ------------------------------------------------------------
-// 6. ĐỌC KẾT QUẢ TỪ GPU
-// ------------------------------------------------------------
+function targetFromDifficulty(diff) {
+  let diffBig;
+  if (typeof diff === 'string') diffBig = BigInt(Math.floor(Number(diff)));
+  else diffBig = BigInt(Math.floor(Number(diff)));
+  const maxTarget = hexToBytes('00000000ffff0000000000000000000000000000000000000000000000000000');
+  const maxBig = BigInt('0x' + Array.from(maxTarget).map(b => b.toString(16).padStart(2, '0')).join(''));
+  const targetBig = maxBig / diffBig;
+  const targetHex = targetBig.toString(16).padStart(64, '0');
+  return hexToBytes(targetHex);
+}
+
 async function readResults() {
   const encoder = device.createCommandEncoder();
   encoder.copyBufferToBuffer(gpuBufferResults, 0, stagingBuffer, 0, 8);
@@ -314,13 +278,8 @@ async function readResults() {
   return { found: data[0], nonce: data[1] };
 }
 
-// ------------------------------------------------------------
-// 7. VÒNG LẶP MINING CHÍNH (ĐÃ SỬA)
-// ------------------------------------------------------------
 async function dispatchHash() {
   if (!currentJob) return;
-
-  // Reset kết quả GPU
   queue.writeBuffer(gpuBufferResults, 0, new Uint32Array([0, 0]));
 
   const commandEncoder = device.createCommandEncoder();
@@ -334,88 +293,68 @@ async function dispatchHash() {
   await device.queue.onSubmittedWorkDone();
   const { found, nonce } = await readResults();
 
-  if (found > 0) {   // SỬA: > 0 thay vì === 1 (phòng trường hợp atomic bị ghi nhiều lần)
-    const extraNonce2Hex = extraNonce2.toString(16).padStart(8, '0');
+  if (found > 0) {
+    // Gửi share với extraNonce2 (hex 8 ký tự)
     self.postMessage({
       type: 'share',
       data: {
         id: 4,
         method: 'mining.submit',
         params: [
-          currentJob[0],         // jobId
-          extraNonce2Hex,        // extraNonce2
-          currentJob[7],         // ntime
-          nonce.toString(16)     // nonce
+          currentJob[0],                         // jobId
+          extraNonce2.toString(16).padStart(8, '0'), // extraNonce2
+          currentJob[7],                         // ntime
+          nonce.toString(16)                     // nonce
         ]
       }
     });
-    // Tìm thấy share → vẫn tăng extraNonce2 để tiếp tục tìm share mới
-    extraNonce2++;
-    await updateBuffers(currentJob);
-  } else {
-    // QUAN TRỌNG: không tìm thấy → vẫn phải thay đổi header để quét tập nonce khác
-    extraNonce2++;
-    await updateBuffers(currentJob);
   }
+
+  // Luôn tăng extraNonce2 để thay đổi merkle root
+  extraNonce2++;
+  await updateBuffers(currentJob);
 }
 
-// ------------------------------------------------------------
-// 8. ĐO HASHRATE
-// ------------------------------------------------------------
 let lastTime = performance.now();
 let hashCountSinceLast = 0;
 
 function mineLoopGPU() {
   if (!running || !currentJob) return;
-
   const start = performance.now();
   dispatchHash().then(() => {
     hashCountSinceLast += NONCES_PER_DISPATCH;
-
     if (performance.now() - lastTime > 1000) {
       hashrate = Math.round(hashCountSinceLast / ((performance.now() - lastTime) / 1000));
       self.postMessage({ type: 'hashrate', value: hashrate, source: 'gpu' });
       hashCountSinceLast = 0;
       lastTime = performance.now();
     }
-
-    // Tiếp tục vòng lặp bất đồng bộ
     setTimeout(mineLoopGPU, 0);
   });
 }
 
-// ------------------------------------------------------------
-// 9. NHẬN LỆNH TỪ MAIN THREAD
-// ------------------------------------------------------------
 self.onmessage = async function (e) {
   const msg = e.data;
   if (msg.type !== 'stratum') return;
-
   try {
     const data = JSON.parse(msg.data);
-
     if (data.method === 'mining.notify') {
       currentJob = data.params;
-      // QUAN TRỌNG: Khởi tạo target từ nbits nếu chưa có target (hoặc đã có target từ set_difficulty thì giữ nguyên)
-      if (!currentTarget) {
+      // Chỉ set target từ nbits nếu target chưa được ghi đè bởi set_difficulty (max target mặc định)
+      if (currentTarget[0] === 0xff && currentTarget[1] === 0xff) {
         currentTarget = targetFromNbits(currentJob[6]);
       }
       if (!device) await initGPU();
-      // Reset extraNonce2 cho job mới (có thể random hoặc =0)
       extraNonce2 = Math.floor(Math.random() * 0xffffffff);
       await updateBuffers(currentJob);
       if (!running) {
         running = true;
         mineLoopGPU();
       }
-    } 
-    else if (data.method === 'mining.set_difficulty') {
-      const diff = data.params[0];
-      // Cập nhật target từ difficulty (ưu tiên hơn nbits)
-      currentTarget = targetFromDifficulty(diff);
+    } else if (data.method === 'mining.set_difficulty') {
+      currentTarget = targetFromDifficulty(data.params[0]);
       if (device && currentJob) await updateBuffers(currentJob);
-    }
-    else if (data.method === 'mining.set_extranonce') {
+    } else if (data.method === 'mining.set_extranonce') {
       extraNonce1 = data.params[0];
       if (device && currentJob) {
         extraNonce2 = Math.floor(Math.random() * 0xffffffff);
@@ -426,21 +365,3 @@ self.onmessage = async function (e) {
     self.postMessage({ type: 'error', error: err.message });
   }
 };
-
-// Difficulty → target (dùng khi pool gửi set_difficulty)
-function targetFromDifficulty(diff) {
-  // Hạn chế mất chính xác: nếu diff là chuỗi, parse trực tiếp thành BigInt
-  let diffBig;
-  if (typeof diff === 'string') {
-    // Nếu là số thực, cắt bỏ phần thập phân
-    diffBig = BigInt(Math.floor(Number(diff)));
-  } else {
-    diffBig = BigInt(Math.floor(Number(diff)));
-  }
-
-  const maxTarget = hexToBytes('00000000ffff0000000000000000000000000000000000000000000000000000');
-  const maxBig = BigInt('0x' + Array.from(maxTarget).map(b => b.toString(16).padStart(2, '0')).join(''));
-  const targetBig = maxBig / diffBig;
-  const targetHex = targetBig.toString(16).padStart(64, '0');
-  return hexToBytes(targetHex);
-}
