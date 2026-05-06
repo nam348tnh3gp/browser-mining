@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BTC Web Miner Real - CPU/GPU</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>⛏️ BTC Web Miner</h1>
+        
+        <!-- Cấu hình pool -->
+        <div class="card">
+            <h3>🔗 Cấu hình Pool</h3>
+            <div class="form-row">
+                <label>Host:</label>
+                <input type="text" id="poolHost" placeholder="stratum.slushpool.com" value="stratum.slushpool.com">
+            </div>
+            <div class="form-row">
+                <label>Port:</label>
+                <input type="number" id="poolPort" value="3333">
+            </div>
+            <div class="form-row">
+                <label>Worker:</label>
+                <input type="text" id="worker" placeholder="username.worker" value="yourworker.1">
+            </div>
+            <div class="form-row">
+                <label>Password:</label>
+                <input type="text" id="password" value="x">
+            </div>
+            <div class="form-row">
+                <label>Threads CPU:</label>
+                <input type="number" id="cpuThreads" value="2" min="1" max="16">
+            </div>
+            <div class="form-row checkbox-row">
+                <label>
+                    <input type="checkbox" id="enableGPU" disabled>
+                    Sử dụng WebGPU (nếu hỗ trợ)
+                </label>
+                <span id="gpuStatus">⏳ Đang kiểm tra...</span>
+            </div>
+            <button id="startBtn">▶ Bắt đầu đào</button>
+            <button id="stopBtn" disabled>⏹ Dừng</button>
+        </div>
+
+        <!-- Thống kê -->
+        <div class="card">
+            <h3>📊 Thống kê</h3>
+            <div class="stats">
+                <p>Tổng Hashrate: <span id="totalHashrate">0</span> H/s</p>
+                <p>CPU Hashrate: <span id="cpuHashrate">0</span> H/s</p>
+                <p>GPU Hashrate: <span id="gpuHashrate">0</span> H/s</p>
+                <p>Shares Accepted: <span id="shares">0</span></p>
+                <p>Shares Rejected: <span id="rejected">0</span></p>
+                <p>Trạng thái: <span id="status">Chưa kết nối</span></p>
+            </div>
+        </div>
+
+        <!-- Log -->
+        <div class="card">
+            <h3>📜 Log</h3>
+            <div class="log" id="log"></div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
