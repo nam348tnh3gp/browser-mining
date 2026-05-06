@@ -1,10 +1,11 @@
-// miner-gpu.js - WebGPU Bitcoin Mining Worker (SHA-256d hoàn chỉnh)
+// miner-gpu.js - WebGPU Bitcoin Mining Worker (Production Ready)
 // Yêu cầu: Trình duyệt hỗ trợ WebGPU (Chrome 113+, Edge 113+, ...)
 
 let currentJob = null;
-let currentTarget = new Uint8Array(32).fill(0xff); // max target mặc định
+let currentTarget = null;               // sẽ được khởi tạo từ nbits hoặc set_difficulty
 let running = false;
 let hashrate = 0;
+let extraNonce1 = '';                  // hex string (thường 8 ký tự) từ pool
 let extraNonce2 = 0;
 
 // WebGPU objects
@@ -14,12 +15,21 @@ let bindGroupLayout, bindGroup;
 let gpuBufferHeader, gpuBufferTarget, gpuBufferResults;
 let stagingBuffer;
 
-const WORKGROUP_SIZE = 256;          // mỗi workgroup xử lý 256 nonce
-const MAX_WORKGROUPS = 64;          // số workgroups mỗi dispatch = 64
-const NONCES_PER_DISPATCH = WORKGROUP_SIZE * MAX_WORKGROUPS; // 16384 nonce/lần
+const WORKGROUP_SIZE = 256;
+const MAX_WORKGROUPS = 64;
+const NONCES_PER_DISPATCH = WORKGROUP_SIZE * MAX_WORKGROUPS; // 16384
 
 // ------------------------------------------------------------
-// 1. KHỞI TẠO GPU VÀ SHADER
+// 1. HÀM BĂM SHA-256D CHO CPU (Web Crypto)
+// ------------------------------------------------------------
+async function sha256d(data) {
+  const hash1 = await crypto.subtle.digest('SHA-256', data);
+  const hash2 = await crypto.subtle.digest('SHA-256', hash1);
+  return new Uint8Array(hash2); // 32 bytes big-endian
+}
+
+// ------------------------------------------------------------
+// 2. KHỞI TẠO GPU VÀ SHADER (giữ nguyên)
 // ------------------------------------------------------------
 async function initGPU() {
   const adapter = await navigator.gpu.requestAdapter();
@@ -27,26 +37,15 @@ async function initGPU() {
   device = await adapter.requestDevice();
   queue = device.queue;
 
-  // Shader WGSL: SHA-256d đầy đủ cho header 80 byte
   const shaderCode = `
-    // Header: 20 u32 (80 bytes, little-endian)
-    struct Header {
-      data: array<u32, 20>
-    };
-    // Target: 8 u32 big-endian (32 bytes), word[0] là byte cao nhất
-    struct Target {
-      data: array<u32, 8>
-    };
-    struct Results {
-      found: atomic<u32>,
-      nonce: u32,       // nonce tìm thấy (đầu tiên)
-    };
+    struct Header { data: array<u32, 20> };
+    struct Target { data: array<u32, 8> };
+    struct Results { found: atomic<u32>, nonce: u32 };
 
     @group(0) @binding(0) var<storage, read> header : Header;
     @group(0) @binding(1) var<storage, read> target : Target;
     @group(0) @binding(2) var<storage, read_write> results : Results;
 
-    // SHA-256 functions
     fn rotr(x: u32, k: u32) -> u32 { return (x >> k) | (x << (32u - k)); }
     fn sigma0(x: u32) -> u32 { return rotr(x, 7u) ^ rotr(x, 18u) ^ (x >> 3u); }
     fn sigma1(x: u32) -> u32 { return rotr(x, 17u) ^ rotr(x, 19u) ^ (x >> 10u); }
@@ -74,7 +73,6 @@ async function initGPU() {
       0x90befffa, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
     );
 
-    // Nén SHA-256 (1 block 512-bit = 16 u32, cập nhật state)
     fn sha256_block(state: ptr<function, array<u32, 8>>, block: ptr<function, array<u32, 16>>) {
       var w: array<u32, 64>;
       for (var i = 0u; i < 16u; i++) { w[i] = (*block)[i]; }
@@ -93,111 +91,62 @@ async function initGPU() {
       (*state)[4] += e; (*state)[5] += f; (*state)[6] += g; (*state)[7] += h;
     }
 
-    // SHA-256 cho dữ liệu độ dài 80 byte (2 block)
     fn sha256_80bytes(input: array<u32, 20>) -> array<u32, 8> {
       var state: array<u32, 8> = array<u32, 8>(
         0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
         0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
       );
-
-      // Block 1: 64 byte đầu (16 u32) + padding (0x80, zero, cuối là độ dài 640 bit)
       var block1: array<u32, 16>;
       for (var i = 0u; i < 16u; i++) { block1[i] = input[i]; }
-      // Padding: thêm 0x80 vào vị trí byte thứ 64 (u32 thứ 16)
-      // Byte 64 là offset 64 trong input (input dài 80 byte, 16 u32 = 64 byte, còn 4 u32 = 16 byte)
-      // Padding phải ở cuối dữ liệu. Ta xử lý riêng block 2.
       sha256_block(&state, &block1);
 
-      // Block 2: 16 byte còn lại (input[16..19]) + padding (0x80 + zero + 640 bit count)
       var block2: array<u32, 16>;
-      // 4 u32 cuối của header (byte 64-79)
       block2[0] = input[16]; block2[1] = input[17]; block2[2] = input[18]; block2[3] = input[19];
-      // Padding: byte 80 = 0x80, byte 81-95 = 0 (u32[4]..u32[6] = 0)
-      // Độ dài 80*8=640 bit, big-endian ở cuối block
-      // Block 2 cần 48 byte padding sau 16 byte dữ liệu -> tổng 64 byte.
-      // Cấu trúc: 4 u32 data, sau đó 0x80, rồi zero, cuối cùng là 8 byte độ dài.
-      // u32[4] = 0x80 (little-endian: byte đầu tiên là 0x80) thực tế là 0x00000080u?
-      // Trong SHA-256, padding bit '1' là 0x80 ở byte đầu tiên sau dữ liệu.
-      // -> block2[4] = 0x80u ở dạng little-endian? Byte đầu tiên trong u32 là byte thấp nhất.
-      // Để chính xác: khối dữ liệu 64 byte được biểu diễn dưới dạng 16 u32 theo little-endian của host (CPU).
-      // Dữ liệu gốc: 4 u32 cuối header, tiếp theo byte 0x80, rồi 47 byte 0, cuối cùng 8 byte độ dài.
-      // Ta trực tiếp gán:
-      // block2[4] = 0x80 (tương đương byte 0x80 ở vị trí byte 0 của u32 này, các byte còn lại 0)
-      // Trong little-endian, giá trị 0x80 chỉ có byte thấp nhất là 0x80, byte cao là 0. Nên block2[4] = 0x80u là đúng.
       block2[4] = 0x80u;
       for (var i = 5u; i < 14u; i++) { block2[i] = 0u; }
-      // Độ dài 80 byte = 640 bit = 0x280, biểu diễn big-endian trong 8 byte cuối.
-      // Vị trí u32[14] và u32[15] là 64-bit big-endian, với host little-endian cần đảo byte.
-      // Độ dài 640 bit => 0x00000000_00000280. Big-endian: byte cao nhất trước.
-      // Trong little-endian, u32[14] (byte 56-59) = 0x00000000, u32[15] (byte 60-63) = 0x00000280? 
-      // Thực tế: 8 byte: 0x00 0x00 0x00 0x00 0x00 0x00 0x02 0x80.
-      // Khi lưu thành 2 u32 little-endian:
-      // u32[14] chứa byte 56-59: 0x00,0x00,0x00,0x00 → 0x00000000
-      // u32[15] chứa byte 60-63: 0x00,0x00,0x02,0x80 → byte0=0x80, byte1=0x02, byte2=0x00, byte3=0x00 => giá trị 0x000280 (little-endian) = 0x00000280.
       block2[14] = 0x00u;
-      block2[15] = 0x000280u; // 640 = 0x280, little-endian lưu byte thấp nhất trước, nên giá trị này đúng.
+      block2[15] = 0x000280u;
       sha256_block(&state, &block2);
-
-      // Trả về state cuối cùng (8 u32, mỗi u32 là word của hash ở dạng little-endian? 
-      // state[i] là một word 32-bit, nhưng cần biết thứ tự byte output. 
-      // Theo quy ước, SHA-256 output là 32 byte big-endian, nhưng state[i] được lưu dưới dạng native (little-endian). 
-      // Khi so sánh với target (big-endian), ta sẽ chuyển đổi state thành mảng 8 u32 big-endian.)
       return state;
     }
 
-    // SHA-256d: hash = SHA256(SHA256(header))
     fn sha256d(header: array<u32, 20>) -> array<u32, 8> {
-      let firstHash = sha256_80bytes(header);      // 8 u32 (little-endian words)
-      // Để hash lần 2, cần chuyển firstHash thành 16 u32 (32 byte) và padding (0x80 + zero + 256 bit)
+      let firstHash = sha256_80bytes(header);
       var input2: array<u32, 16>;
-      // Copy 8 u32 của firstHash vào input2[0..7]
       for (var i = 0u; i < 8u; i++) { input2[i] = firstHash[i]; }
-      // Padding: input 32 byte, thêm 0x80, zero, và độ dài 256 bit
-      input2[8] = 0x80u; // byte 0x80 sau dữ liệu
+      input2[8] = 0x80u;
       for (var i = 9u; i < 14u; i++) { input2[i] = 0u; }
-      // Độ dài 32 byte = 256 bit = 0x100, big-endian 8 byte: 0x00 0x00 0x00 0x00 0x00 0x00 0x01 0x00
-      // Little-endian: u32[14]=0x00, u32[15]=0x00000100 (vì byte thấp nhất là 0x00, byte tiếp là 0x01)
       input2[14] = 0x00u;
       input2[15] = 0x00000100u;
-      
+
       var state2: array<u32, 8> = array<u32, 8>(
         0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
         0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
       );
       sha256_block(&state2, &input2);
-      return state2; // 8 u32 little-endian words của hash cuối cùng
+      return state2;
     }
 
     @compute @workgroup_size(256)
     fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-      let idx = gid.x; // 0..255
-      // Mỗi invocation xử lý 1 nonce = baseNonce + idx + workgroup_id * 256
-      // baseNonce được truyền qua results.nonce tạm thời, nhưng ta dùng global id thay thế
-      let workgroup_id = gid.z * 64u + gid.y; // đơn giản gid.z=0, gid.y từ 0..63
-      let nonce = workgroup_id * 256u + idx; // nonce 32-bit
+      let idx = gid.x;
+      let workgroup_id = gid.z * 64u + gid.y;
+      let nonce = workgroup_id * 256u + idx;
 
-      // Copy header, thay đổi nonce ở word cuối (little-endian)
       var h: array<u32, 20> = header.data;
-      h[19] = nonce; // nonce ở word 19 (byte 76-79)
+      h[19] = nonce;
 
-      let hash = sha256d(h); // 8 u32 little-endian words
+      let hash = sha256d(h);
 
-      // Chuyển hash thành big-endian để so sánh với target (target cũng big-endian)
-      // target.data[i] là u32 big-endian word thứ i (từ cao xuống thấp)
-      // Cần so sánh hash (32 byte) với target bytewise.
-      // Ta sẽ so sánh từ word 0 đến 7 của target (big-endian) với hash đã đảo byte thành big-endian.
       var passed = true;
       for (var i = 0u; i < 8u; i++) {
-        // Lấy word big-endian từ hash: đảo byte của hash[i] (little-endian) -> big-endian
         let word_le = hash[i];
         let word_be = ((word_le >> 24u) & 0xFFu) |
                       ((word_le >> 8u) & 0xFF00u) |
                       ((word_le << 8u) & 0xFF0000u) |
                       ((word_le << 24u) & 0xFF000000u);
-        // target data đã là big-endian (word đầu tiên là byte cao nhất)
         let t = target.data[i];
         if word_be < t {
-          // Hash < target => hợp lệ, break vòng lặp và ghi kết quả
           break;
         } else if word_be > t {
           passed = false;
@@ -206,8 +155,6 @@ async function initGPU() {
       }
 
       if (passed) {
-        // Hash <= target
-        // Thử ghi nonce vào kết quả nếu chưa ai ghi (atomic compare exchange)
         let zero = 0u;
         let exchanged = atomicCompareExchangeWeak(&results.found, &zero, 1u);
         if (exchanged) {
@@ -233,7 +180,6 @@ async function initGPU() {
     compute: { module: shaderModule, entryPoint: 'main' }
   });
 
-  // Buffers
   gpuBufferHeader = device.createBuffer({
     size: 80,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
@@ -243,7 +189,7 @@ async function initGPU() {
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
   });
   gpuBufferResults = device.createBuffer({
-    size: 8, // 4 byte atomic found + 4 byte nonce
+    size: 8,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
   });
   stagingBuffer = device.createBuffer({
@@ -262,7 +208,7 @@ async function initGPU() {
 }
 
 // ------------------------------------------------------------
-// 2. XÂY DỰNG HEADER 80 BYTES TỪ JOB
+// 3. TIỆN ÍCH CHUYỂN ĐỔI
 // ------------------------------------------------------------
 function hexToBytes(hex) {
   if (hex.length % 2) hex = '0' + hex;
@@ -273,52 +219,44 @@ function hexToBytes(hex) {
   return bytes;
 }
 
-// Hàm SHA-256d cho CPU (dùng trong worker nếu không có importScripts, ta import sha256.js ở đầu file)
-importScripts('sha256.js');
-
-function buildMerkleRoot(coinb1, coinb2, merkleBranch, extraNonce1, extraNonce2) {
+// ------------------------------------------------------------
+// 4. XÂY DỰNG MERKLE ROOT & HEADER
+// ------------------------------------------------------------
+async function buildMerkleRoot(coinb1, coinb2, merkleBranch) {
   const coinbaseHex = coinb1 + extraNonce1 + extraNonce2.toString(16).padStart(8, '0') + coinb2;
   const coinbaseBytes = hexToBytes(coinbaseHex);
-  let merkleRoot = sha256d(coinbaseBytes);
+  let merkleRoot = await sha256d(coinbaseBytes);
+
   for (const branch of merkleBranch) {
     const branchBytes = hexToBytes(branch);
     const combined = new Uint8Array(64);
     combined.set(merkleRoot, 0);
     combined.set(branchBytes, 32);
-    merkleRoot = sha256d(combined);
+    merkleRoot = await sha256d(combined);
   }
-  return merkleRoot; // Uint8Array(32) big-endian
+  return merkleRoot; // 32 bytes big-endian
 }
 
-function buildHeader(job, nonce) {
-  const version = parseInt(job[5], 16); // version hex -> number, sẽ viết little-endian
-  const prevHash = hexToBytes(job[1]);   // 32 bytes big-endian (đúng format)
-  // Tính merkle root
-  const extraNonce1 = ''; // nếu pool gửi extraNonce1 riêng, thêm vào; hiện tại để trống
-  const merkleRoot = buildMerkleRoot(job[2], job[3], job[4], extraNonce1, extraNonce2);
+async function buildHeader(job) {
+  const version = parseInt(job[5], 16);
+  const prevHash = hexToBytes(job[1]);
+  const merkleRoot = await buildMerkleRoot(job[2], job[3], job[4]);
   const ntime = parseInt(job[7], 16);
   const nbits = parseInt(job[6], 16);
-  
+
   const header = new Uint8Array(80);
   const view = new DataView(header.buffer);
-  
-  // Version (4 bytes little-endian)
+
   view.setInt32(0, version, true);
-  // PrevHash (32 bytes, giữ nguyên thứ tự big-endian, phải đặt đúng vị trí)
   header.set(prevHash, 4);
-  // MerkleRoot (32 bytes big-endian)
   header.set(merkleRoot, 36);
-  // ntime (4 bytes little-endian)
   view.setInt32(68, ntime, true);
-  // nbits (4 bytes little-endian)
   view.setInt32(72, nbits, true);
-  // nonce (4 bytes little-endian)
-  view.setInt32(76, nonce, true);
-  
+  view.setInt32(76, 0, true); // nonce = 0 (shader tự đặt)
+
   return header;
 }
 
-// Chuyển header 80 bytes thành 20 u32 little-endian cho GPU
 function headerToUint32Array(headerBytes) {
   const u32 = new Uint32Array(20);
   const view = new DataView(headerBytes.buffer);
@@ -329,25 +267,41 @@ function headerToUint32Array(headerBytes) {
 }
 
 // Cập nhật header và target buffer
-function updateBuffers(job) {
-  extraNonce2 = Math.floor(Math.random() * 0xffffffff); // khởi tạo ngẫu nhiên
-  const headerBytes = buildHeader(job, 0); // nonce tạm thời = 0 (shader sẽ thay)
+async function updateBuffers(job) {
+  const headerBytes = await buildHeader(job);
   const headerU32 = headerToUint32Array(headerBytes);
   queue.writeBuffer(gpuBufferHeader, 0, headerU32.buffer);
 
-  // Target: currentTarget là 32 byte big-endian, cần chuyển thành 8 u32 big-endian để shader so sánh
+  // Chuyển target thành 8 u32 big-endian
   const targetU32 = new Uint32Array(8);
   for (let i = 0; i < 8; i++) {
-    targetU32[i] = (currentTarget[i*4] << 24) | 
-                   (currentTarget[i*4+1] << 16) | 
-                   (currentTarget[i*4+2] << 8) | 
-                   currentTarget[i*4+3];
+    targetU32[i] = (currentTarget[i * 4] << 24) |
+      (currentTarget[i * 4 + 1] << 16) |
+      (currentTarget[i * 4 + 2] << 8) |
+      currentTarget[i * 4 + 3];
   }
   queue.writeBuffer(gpuBufferTarget, 0, targetU32.buffer);
 }
 
 // ------------------------------------------------------------
-// 3. KHỞI CHẠY MINING & ĐỌC KẾT QUẢ
+// 5. TÍNH TARGET TỪ NBITS (theo chuẩn Bitcoin)
+// ------------------------------------------------------------
+function targetFromNbits(nbits) {
+  const num = parseInt(nbits, 16);
+  const exp = (num >> 24) & 0xff;
+  const mant = num & 0x00ffffff;
+  // Nếu exp ≤ 3, target coi như bằng 0 (cực khó, không thể đào)
+  if (exp <= 3) return new Uint8Array(32); // toàn 0
+  const target = new Uint8Array(32);
+  target[32 - exp] = (mant >> 16) & 0xff;
+  target[32 - exp + 1] = (mant >> 8) & 0xff;
+  target[32 - exp + 2] = mant & 0xff;
+  // Các byte còn lại giữ 0, riêng các byte đầu (cao nhất) cũng 0.
+  return target;
+}
+
+// ------------------------------------------------------------
+// 6. ĐỌC KẾT QUẢ TỪ GPU
 // ------------------------------------------------------------
 async function readResults() {
   const encoder = device.createCommandEncoder();
@@ -360,98 +314,131 @@ async function readResults() {
   return { found: data[0], nonce: data[1] };
 }
 
+// ------------------------------------------------------------
+// 7. VÒNG LẶP MINING CHÍNH (ĐÃ SỬA)
+// ------------------------------------------------------------
 async function dispatchHash() {
   if (!currentJob) return;
 
-  // Reset buffer kết quả
+  // Reset kết quả GPU
   queue.writeBuffer(gpuBufferResults, 0, new Uint32Array([0, 0]));
 
   const commandEncoder = device.createCommandEncoder();
   const passEncoder = commandEncoder.beginComputePass();
   passEncoder.setPipeline(computePipeline);
   passEncoder.setBindGroup(0, bindGroup);
-  passEncoder.dispatchWorkgroups(MAX_WORKGROUPS); // dispatches 64 workgroups
+  passEncoder.dispatchWorkgroups(MAX_WORKGROUPS);
   passEncoder.end();
   device.queue.submit([commandEncoder.finish()]);
 
   await device.queue.onSubmittedWorkDone();
   const { found, nonce } = await readResults();
 
-  if (found === 1) {
-    // Tìm thấy nonce hợp lệ -> submit share
-    const job = currentJob;
-    const shareParams = [
-      job[0],   // jobId
-      '',       // extraNonce2 (đã được tính trong merkle root, ta gửi lại để pool biết)
-      job[7],   // ntime (hex string)
-      nonce.toString(16)
-    ];
+  if (found > 0) {   // SỬA: > 0 thay vì === 1 (phòng trường hợp atomic bị ghi nhiều lần)
+    const extraNonce2Hex = extraNonce2.toString(16).padStart(8, '0');
     self.postMessage({
       type: 'share',
       data: {
         id: 4,
         method: 'mining.submit',
-        params: shareParams
+        params: [
+          currentJob[0],         // jobId
+          extraNonce2Hex,        // extraNonce2
+          currentJob[7],         // ntime
+          nonce.toString(16)     // nonce
+        ]
       }
     });
-    // Tăng extraNonce2 để tiếp tục
+    // Tìm thấy share → vẫn tăng extraNonce2 để tiếp tục tìm share mới
     extraNonce2++;
-    updateBuffers(currentJob);
+    await updateBuffers(currentJob);
+  } else {
+    // QUAN TRỌNG: không tìm thấy → vẫn phải thay đổi header để quét tập nonce khác
+    extraNonce2++;
+    await updateBuffers(currentJob);
   }
 }
 
-// Đo hashrate ước tính
+// ------------------------------------------------------------
+// 8. ĐO HASHRATE
+// ------------------------------------------------------------
 let lastTime = performance.now();
 let hashCountSinceLast = 0;
 
 function mineLoopGPU() {
   if (!running || !currentJob) return;
-  
+
   const start = performance.now();
   dispatchHash().then(() => {
-    const elapsed = performance.now() - start;
     hashCountSinceLast += NONCES_PER_DISPATCH;
-    
-    // Cập nhật hashrate mỗi giây
+
     if (performance.now() - lastTime > 1000) {
       hashrate = Math.round(hashCountSinceLast / ((performance.now() - lastTime) / 1000));
       self.postMessage({ type: 'hashrate', value: hashrate, source: 'gpu' });
       hashCountSinceLast = 0;
       lastTime = performance.now();
     }
-    
-    // Tiếp tục vòng lặp
+
+    // Tiếp tục vòng lặp bất đồng bộ
     setTimeout(mineLoopGPU, 0);
   });
 }
 
 // ------------------------------------------------------------
-// 4. NHẬN MESSAGE TỪ MAIN THREAD
+// 9. NHẬN LỆNH TỪ MAIN THREAD
 // ------------------------------------------------------------
-self.onmessage = async function(e) {
+self.onmessage = async function (e) {
   const msg = e.data;
-  if (msg.type === 'stratum') {
+  if (msg.type !== 'stratum') return;
+
+  try {
     const data = JSON.parse(msg.data);
+
     if (data.method === 'mining.notify') {
       currentJob = data.params;
+      // QUAN TRỌNG: Khởi tạo target từ nbits nếu chưa có target (hoặc đã có target từ set_difficulty thì giữ nguyên)
+      if (!currentTarget) {
+        currentTarget = targetFromNbits(currentJob[6]);
+      }
       if (!device) await initGPU();
-      updateBuffers(currentJob);
+      // Reset extraNonce2 cho job mới (có thể random hoặc =0)
+      extraNonce2 = Math.floor(Math.random() * 0xffffffff);
+      await updateBuffers(currentJob);
       if (!running) {
         running = true;
         mineLoopGPU();
       }
-    } else if (data.method === 'mining.set_difficulty') {
-      // Cập nhật target từ difficulty (như ở CPU miner)
+    } 
+    else if (data.method === 'mining.set_difficulty') {
       const diff = data.params[0];
+      // Cập nhật target từ difficulty (ưu tiên hơn nbits)
       currentTarget = targetFromDifficulty(diff);
-      if (device && currentJob) updateBuffers(currentJob);
+      if (device && currentJob) await updateBuffers(currentJob);
     }
+    else if (data.method === 'mining.set_extranonce') {
+      extraNonce1 = data.params[0];
+      if (device && currentJob) {
+        extraNonce2 = Math.floor(Math.random() * 0xffffffff);
+        await updateBuffers(currentJob);
+      }
+    }
+  } catch (err) {
+    self.postMessage({ type: 'error', error: err.message });
   }
 };
 
+// Difficulty → target (dùng khi pool gửi set_difficulty)
 function targetFromDifficulty(diff) {
+  // Hạn chế mất chính xác: nếu diff là chuỗi, parse trực tiếp thành BigInt
+  let diffBig;
+  if (typeof diff === 'string') {
+    // Nếu là số thực, cắt bỏ phần thập phân
+    diffBig = BigInt(Math.floor(Number(diff)));
+  } else {
+    diffBig = BigInt(Math.floor(Number(diff)));
+  }
+
   const maxTarget = hexToBytes('00000000ffff0000000000000000000000000000000000000000000000000000');
-  const diffBig = BigInt(Math.floor(diff));
   const maxBig = BigInt('0x' + Array.from(maxTarget).map(b => b.toString(16).padStart(2, '0')).join(''));
   const targetBig = maxBig / diffBig;
   const targetHex = targetBig.toString(16).padStart(64, '0');
