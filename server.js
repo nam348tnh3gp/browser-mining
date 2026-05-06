@@ -6,47 +6,40 @@ const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const PORT = process.env.PORT || 3000;
+
+// Origin check để tránh abuse
+const wss = new WebSocket.Server({
+    server,
+    verifyClient: (info) => {
+        const origin = info.origin;
+        // Cho phép localhost, 127.0.0.1, và file:// (origin = 'null')
+        return origin === `http://localhost:${PORT}` ||
+               origin === `http://127.0.0.1:${PORT}` ||
+               origin === `http://[::1]:${PORT}` ||
+               origin === 'null';
+    }
+});
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Hàm parse pool URL: hỗ trợ stratum+tcp://, ws://, wss://, hoặc host:port thuần
+// Hàm parse pool URL – hỗ trợ stratum+tcp://, ws://, wss://, host:port
 function parsePoolUrl(url) {
-    if (!url) throw new Error('Pool URL is required');
-    
-    // Nếu có scheme stratum+tcp://
+    if (!url) throw new Error('Pool URL required');
     if (url.startsWith('stratum+tcp://')) {
         const cleaned = url.replace('stratum+tcp://', '');
         const [host, portStr] = cleaned.split(':');
-        return {
-            host: host,
-            port: parseInt(portStr) || 3333
-        };
+        return { host, port: parseInt(portStr) || 3333 };
     }
-    
-    // Nếu là ws:// hoặc wss:// (có thể forward qua bridge khác)
     if (url.startsWith('ws://') || url.startsWith('wss://')) {
         const parsed = new URL(url);
-        return {
-            host: parsed.hostname,
-            port: parseInt(parsed.port) || (url.startsWith('wss://') ? 443 : 80)
-        };
+        return { host: parsed.hostname, port: parseInt(parsed.port) || (url.startsWith('wss://') ? 443 : 80) };
     }
-    
-    // Fallback: hostname:port không scheme
     if (url.includes(':')) {
         const [host, portStr] = url.split(':');
-        return {
-            host: host,
-            port: parseInt(portStr) || 3333
-        };
+        return { host, port: parseInt(portStr) || 3333 };
     }
-    
-    // Mặc định host:port 3333
-    return {
-        host: url,
-        port: 3333
-    };
+    return { host: url, port: 3333 };
 }
 
 wss.on('connection', (ws) => {
@@ -55,106 +48,81 @@ wss.on('connection', (ws) => {
     let reconnectTimer = null;
     let pingInterval = null;
     let currentConfig = null;
-    let buffer = ''; // Buffer cho TCP data chunks
+    let buffer = '';
 
-    // Cleanup function
     const cleanup = () => {
-        if (reconnectTimer) {
-            clearTimeout(reconnectTimer);
-            reconnectTimer = null;
-        }
-        if (pingInterval) {
-            clearInterval(pingInterval);
-            pingInterval = null;
-        }
-        if (poolSocket) {
-            poolSocket.destroy();
-            poolSocket = null;
-        }
+        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+        if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+        if (poolSocket) { poolSocket.destroy(); poolSocket = null; }
         isConnected = false;
     };
 
-    // Kết nối đến pool
     const connectToPool = (config) => {
         cleanup();
         currentConfig = config;
-
         const { host, port, worker, password } = config;
         console.log(`[Pool] Connecting to ${host}:${port} | Worker: ${worker}`);
 
         poolSocket = new net.Socket();
-        poolSocket.setKeepAlive(true, 60000); // TCP keep-alive
+        poolSocket.setKeepAlive(true, 60000);
 
         poolSocket.connect(port, host, () => {
-            console.log(`[Pool] TCP connected to ${host}:${port}`);
+            console.log('[Pool] TCP connected');
             isConnected = true;
             buffer = '';
 
-            // Gửi mining.subscribe
-            const subMsg = JSON.stringify({ 
-                id: 1, 
-                method: "mining.subscribe", 
-                params: ["browser-miner/2.0.0", "github.com/nam348tnh3gp/browser-mining"] 
+            // Subscribe
+            const subMsg = JSON.stringify({
+                id: 1,
+                method: "mining.subscribe",
+                params: ["browser-miner/2.0.0"]
             }) + '\n';
             poolSocket.write(subMsg);
-            console.log('[Pool] Sent: mining.subscribe');
+            console.log('[Pool] Sent subscribe');
 
-            // Gửi mining.authorize
-            const authMsg = JSON.stringify({ 
-                id: 2, 
-                method: "mining.authorize", 
-                params: [worker, password || 'x'] 
+            // Authorize
+            const authMsg = JSON.stringify({
+                id: 2,
+                method: "mining.authorize",
+                params: [worker, password || 'x']
             }) + '\n';
             poolSocket.write(authMsg);
-            console.log('[Pool] Sent: mining.authorize');
+            console.log('[Pool] Sent authorize');
 
-            ws.send(JSON.stringify({ 
-                type: 'status', 
-                message: `Connected to ${host}:${port}` 
-            }));
+            ws.send(JSON.stringify({ type: 'status', message: `Connected to pool` }));
 
-            // Gửi mining.ping mỗi 30 giây để giữ kết nối
+            // Keep-alive ping mỗi 30s
             pingInterval = setInterval(() => {
                 if (isConnected && poolSocket && !poolSocket.destroyed) {
-                    const pingMsg = JSON.stringify({ 
-                        id: 0, 
-                        method: "mining.ping" 
-                    }) + '\n';
-                    poolSocket.write(pingMsg);
+                    poolSocket.write(JSON.stringify({ id: 0, method: "mining.ping" }) + '\n');
                 }
             }, 30000);
         });
 
-        // Nhận dữ liệu từ pool (có xử lý buffer cho chunked data)
         poolSocket.on('data', (chunk) => {
             buffer += chunk.toString();
             const lines = buffer.split('\n');
-            // Giữ lại phần chưa hoàn chỉnh
             buffer = lines.pop() || '';
-            
             for (const line of lines) {
                 if (!line.trim()) continue;
+                // Forward raw line đến browser
+                ws.send(JSON.stringify({ type: 'pool', data: line.trim() }));
                 try {
-                    // Forward raw stratum message đến browser
-                    ws.send(JSON.stringify({ 
-                        type: 'pool', 
-                        data: line.trim() 
-                    }));
-                    
-                    // Log parsed message (debug)
                     const parsed = JSON.parse(line.trim());
                     if (parsed.method === 'mining.set_difficulty') {
-                        console.log(`[Pool] Difficulty set: ${parsed.params[0]}`);
+                        console.log(`[Pool] Difficulty: ${parsed.params[0]}`);
                     } else if (parsed.method === 'mining.notify') {
-                        console.log(`[Pool] New job #${parsed.params[0]} received`);
+                        console.log(`[Pool] New job #${parsed.params[0]}`);
+                    } else if (parsed.result !== undefined) {
+                        // Kết quả submit share (true/false)
+                        ws.send(JSON.stringify({
+                            type: 'share_result',
+                            accepted: parsed.result === true,
+                            error: parsed.error || null
+                        }));
+                        console.log(`[Pool] Share ${parsed.result ? 'accepted' : 'rejected'}`);
                     }
-                } catch (e) {
-                    // Forward raw line nếu không parse được JSON
-                    ws.send(JSON.stringify({ 
-                        type: 'pool', 
-                        data: line.trim() 
-                    }));
-                }
+                } catch (e) { /* ignore parse error */ }
             }
         });
 
@@ -163,8 +131,6 @@ wss.on('connection', (ws) => {
             isConnected = false;
             if (pingInterval) clearInterval(pingInterval);
             ws.send(JSON.stringify({ type: 'status', message: 'Pool disconnected' }));
-            
-            // Auto reconnect sau 10 giây
             if (currentConfig) {
                 reconnectTimer = setTimeout(() => {
                     console.log('[Pool] Attempting reconnect...');
@@ -175,59 +141,48 @@ wss.on('connection', (ws) => {
 
         poolSocket.on('error', (err) => {
             console.error(`[Pool] Error: ${err.message}`);
-            ws.send(JSON.stringify({ 
-                type: 'error', 
-                message: `Pool error: ${err.message}` 
-            }));
-        });
-
-        poolSocket.on('timeout', () => {
-            console.log('[Pool] Socket timeout');
-            if (poolSocket) poolSocket.destroy();
+            ws.send(JSON.stringify({ type: 'error', message: `Pool: ${err.message}` }));
         });
     };
 
-    // Xử lý message từ browser
     ws.on('message', (data) => {
         try {
             const msg = JSON.parse(data);
 
             if (msg.type === 'connect') {
-                // Parse pool URL và thông tin kết nối
-                let poolInfo;
-                
-                // Hỗ trợ format mới: { pool, wallet } hoặc cũ: { host, port, worker, password }
+                let config;
                 if (msg.pool) {
-                    poolInfo = parsePoolUrl(msg.pool);
-                    poolInfo.worker = msg.wallet || msg.worker || '';
-                    poolInfo.password = msg.password || 'x';
+                    // Format mới: { pool, wallet, password }
+                    const poolInfo = parsePoolUrl(msg.pool);
+                    config = {
+                        host: poolInfo.host,
+                        port: poolInfo.port,
+                        worker: msg.wallet || msg.worker || '',
+                        password: msg.password || 'x'
+                    };
                 } else {
-                    // Backward compatible với format cũ
-                    poolInfo = {
+                    // Format cũ: { host, port, worker, password }
+                    config = {
                         host: msg.host,
                         port: msg.port || 3333,
-                        worker: msg.worker || msg.wallet || '',
+                        worker: msg.worker || '',
                         password: msg.password || 'x'
                     };
                 }
-
-                console.log(`[Bridge] Client connecting to pool: ${poolInfo.host}:${poolInfo.port}`);
-                connectToPool(poolInfo);
+                connectToPool(config);
             }
-            else if (msg.type === 'share' && isConnected && poolSocket && !poolSocket.destroyed) {
-                // Forward share từ browser đến pool
+            // Chấp nhận cả type 'share' lẫn 'mining' để tương thích
+            else if ((msg.type === 'share' || msg.type === 'mining') && isConnected && poolSocket && !poolSocket.destroyed) {
                 const shareMsg = JSON.stringify(msg.data) + '\n';
                 poolSocket.write(shareMsg);
-                console.log(`[Share] Submitted: ${JSON.stringify(msg.data.params)}`);
+                console.log(`[Share] Forwarded: ${JSON.stringify(msg.data.params)}`);
             }
             else if (msg.type === 'disconnect') {
                 cleanup();
                 currentConfig = null;
                 ws.send(JSON.stringify({ type: 'status', message: 'Disconnected' }));
             }
-
         } catch (e) {
-            console.error(`[Bridge] Error processing message: ${e.message}`);
             ws.send(JSON.stringify({ type: 'error', message: `Bridge error: ${e.message}` }));
         }
     });
@@ -239,22 +194,14 @@ wss.on('connection', (ws) => {
     });
 
     ws.on('error', (err) => {
-        console.error(`[Bridge] WebSocket error: ${err.message}`);
+        console.error(`[Bridge] WS error: ${err.message}`);
         cleanup();
     });
 });
 
-// Health check endpoint
+// Health check
 app.get('/health', (req, res) => {
-    res.json({ 
-        status: 'ok', 
-        uptime: process.uptime(),
-        timestamp: Date.now()
-    });
+    res.json({ status: 'ok', uptime: process.uptime() });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`[Bridge] Server running on port ${PORT}`);
-    console.log(`[Bridge] Open http://localhost:${PORT} in browser`);
-});
+server.listen(PORT, () => console.log(`Bridge server running on port ${PORT}`));
