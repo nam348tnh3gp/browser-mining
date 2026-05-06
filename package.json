@@ -1,0 +1,13 @@
+{
+  "name": "btc-webminer",
+  "version": "1.0.0",
+  "description": "Bitcoin miner in browser with CPU/GPU support",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.13.0"
+  }
+}
